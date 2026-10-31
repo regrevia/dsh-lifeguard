@@ -1,6 +1,6 @@
 {
   "name": "dsh-lifeguard",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "把 DSH 真实崩溃日志沉淀成精简约束：装插件前静态预检拦崩、装完体检冲突，起不来时受控自愈",
   "type": "module",
   "exports": {

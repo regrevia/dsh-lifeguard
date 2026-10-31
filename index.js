@@ -220,6 +220,35 @@ function log(message) {
   }
 }
 
+/* 工作区成员是「记录里的 id」再过一遍 cwd 索引，两步都可能没认下新会话：这里只认回读结果。 */
+function workspaceHasSession(ws, sessionId) {
+  try {
+    const ids = propOf(ws, 'sessionIds');
+    return Array.isArray(ids) && ids.includes(sessionId);
+  } catch {
+    return false;
+  }
+}
+
+/* 新会话的表头：活的会话进程里就有，没有就去会话服务要一次，都拿不到返回 null。 */
+function liveHeaderOf(ctx, sessionId) {
+  const sessions = serviceOf(ctx, 'sessions');
+  if (!sessions) return null;
+  try {
+    const session = typeof sessions.get === 'function' ? sessions.get(sessionId) : undefined;
+    if (session && session.header) return session.header;
+  } catch {
+    /* fall through */
+  }
+  try {
+    const list = typeof sessions.list === 'function' ? sessions.list() : [];
+    const found = list.find((item) => item?.header?.id === sessionId);
+    return found?.header ?? null;
+  } catch {
+    return null;
+  }
+}
+
 /* The wall that actually kills this machine, read from its own crash log: V8 dies in old space
  * before the nominal limit, so the badge counts against the observed death heap, not the limit. */
 let crashWallCache = null;
@@ -393,15 +422,32 @@ async function handoffOne(ctx, { home, state, sessions, call, sourceId, current,
   /* 新会话默认不进左侧列表：建出来就挂到它 cwd 所属的工作区，转世完就能直接点开。
    * 挂不上不算转世失败，只是要告诉人一声。 */
   let attached = false;
+  let attachNote = cwd ? '没有对应的工作区' : '原会话没有 cwd';
   try {
     const registry = serviceOf(ctx, 'workspaceRegistry');
     const ws = registry && typeof registry.resolveByPath === 'function' && cwd ? await registry.resolveByPath(cwd) : null;
     if (ws && typeof ws.attachSession === 'function') {
       await ws.attachSession(childId);
-      attached = true;
+      /* attachSession 落盘成功不等于列表里能看见：工作区的 sessionIds 会用启动时建的
+       * cwd 索引再过滤一遍，新会话还没进那张表时会被静默滤掉。回读一次，不认就补索引。 */
+      attached = workspaceHasSession(ws, childId);
+      if (!attached && typeof registry.indexHeader === 'function') {
+        const header = liveHeaderOf(ctx, childId);
+        if (header) {
+          try {
+            await registry.indexHeader(header);
+          } catch (error) {
+            log(`新会话的 cwd 索引没补上：${error?.message ?? error}`);
+          }
+          attached = workspaceHasSession(ws, childId);
+        }
+      }
+      attachNote = attached ? '' : '工作区的 cwd 索引里没有它，列表会把它滤掉';
+      if (!attached) log(`新会话 ${childId} 挂上了但列表里看不到：${attachNote}`);
     }
   } catch (error) {
-    log(`新会话没挂进工作区：${error?.message ?? error}`);
+    attachNote = String(error?.message ?? error);
+    log(`新会话没挂进工作区：${attachNote}`);
   }
   /* 交接单由模型读懂原会话后写；调用记在新会话名下（它已经建好），原会话的记录不被改写。
    * 任何一步失败都退回确定性那份——转世本身不能因为整理失败而失败。 */
@@ -513,7 +559,7 @@ async function handoffOne(ctx, { home, state, sessions, call, sourceId, current,
     briefSaved && delivered === 'message' ? '交接单已经发到新会话里，它会先回一句「收到」等你下一步。' : briefSaved ? `交接单已经写入 ${briefPath}，下次打开新会话时按它接着干。` : '',
     model ? `交接单由 ${model.provider}/${model.model} 整理，${brief.text.length} 字。` : `交接单是自动摘要，${brief.text.length} 字：${llmNote || '没开模型整理'}。`,
     archived ? `原会话 ${sourceId} 已归档，需要细节时取消归档回看，不会删。` : `原会话 ${sourceId} 没有归档成功（工作区服务没接上），但记录都还在。`,
-    attached ? '' : `新会话没挂进左侧列表（${cwd ? '工作区对不上' : '原会话没有 cwd'}），重启后在列表里看不到它，要手动打开。`,
+    attached ? '' : `新会话没挂进左侧列表（${attachNote}），重启后在列表里看不到它，要手动打开。`,
     '内存只有重启才拿得回来：重启前新会话可能有一个未完成回合，重启后打开它再发一句「继续」。',
     '血缘记在插件自己的记录里，改标题不会丢；要看链条用 lifeguard_lineage。',
   ];

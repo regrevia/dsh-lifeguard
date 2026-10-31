@@ -17,7 +17,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 import { correlateIncidents, crashLoops } from './lib/attribute.mjs';
 import { footprintBefore } from './lib/sessions.mjs';
 
-export const VERSION = '0.7.1';
+export const VERSION = '0.7.2';
 export const DEFAULT_HOME = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
 
 /* 新数据目录；旧版目录名只用于一次性迁移与读取回退。 */
