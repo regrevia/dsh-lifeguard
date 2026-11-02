@@ -436,11 +436,15 @@ test('the memory ring route is mounted when webServer already exists', async () 
     const server = { register: (route) => { routes.push(route); return () => {}; } };
     const ctx = makeContext({ webServer: server });
     apply(ctx, {});
-    assert.equal(routes.length, 1);
-    assert.equal(routes[0].path, '/lifeguard/health');
+    /* 圈和构成各一条路由：圈常驻，构成只在点开时才被请求。 */
+    assert.equal(routes.length, 2);
+    const health = routes.find((route) => route.path === '/lifeguard/health');
+    const memory = routes.find((route) => route.path === '/lifeguard/memory');
+    assert.ok(health && memory, '两条路由都要挂上');
+    assert.equal(memory.kind, 'exact');
     const body = await new Promise((resolve) => {
       const chunks = [];
-      routes[0].handler({}, { writeHead: () => {}, end: (chunk) => resolve(String(chunk)) });
+      health.handler({}, { writeHead: () => {}, end: (chunk) => resolve(String(chunk)) });
       void chunks;
     });
     const payload = JSON.parse(body);
@@ -461,7 +465,7 @@ test('a webServer that only shows up after apply still gets the route', async ()
     assert.deepEqual(injected.keys, ['webServer']);
     ctx.get = (key) => (key === 'webServer' ? server : undefined);
     injected.scopeFactory(ctx);
-    assert.equal(routes.length, 1);
-    assert.equal(routes[0].path, '/lifeguard/health');
+    assert.equal(routes.length, 2);
+    assert.deepEqual(routes.map((route) => route.path).sort(), ['/lifeguard/health', '/lifeguard/memory']);
   });
 });

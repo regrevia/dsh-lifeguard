@@ -15,6 +15,7 @@ import { heapLine, heapPressure, noteCrashMB, startWatchdog, stopWatchdog, watch
 import { DEFAULT_BUDGET_MB, SWEEP_EVERY_MS, maybeSweep } from './tmp.mjs';
 import { admit, readLive, wallFor } from './pressure.mjs';
 import { footprintLines, oomEvidenceLines, sessionFootprint } from './lib/sessions.mjs';
+import { buildMemory } from './lib/memory.mjs';
 import { crashLoops, loopLines } from './lib/attribute.mjs';
 import {
   MODE_LABELS,
@@ -307,6 +308,80 @@ async function readSessionTitle(ctx, sessionId, signal) {
   }
 }
 
+/* 圈上点开就是它。按会话记账测不到，能测的只有记录体积，折出来的数一律写「估」。
+ * 只读：不关会话、不杀任务、不删记录。 */
+const MEMORY_TTL_MS = 15000;
+const memoryCache = { at: 0, body: null };
+
+/* 会话服务手里的标题：item 上没有顶层 title，标题在 projections.values.title 里；
+ * 列表里拿不到才去会话日志折一次。 */
+async function sessionTitles(ctx, ids) {
+  const found = new Map();
+  try {
+    const sessions = serviceOf(ctx, 'sessions');
+    if (sessions && typeof sessions.list === 'function') {
+      let page = sessions.list();
+      if (page && typeof page.then === 'function') page = await page;
+      /* 分页和不分页两种返回都要认：page.items 或直接数组。 */
+      const items = Array.isArray(page) ? page : Array.isArray(page?.items) ? page.items : [];
+      for (const item of items) {
+        const id = item?.sessionId ?? item?.id ?? item?.header?.id;
+        const values = item?.projections?.values ?? item?.header?.projections?.values ?? null;
+        const title = values?.title ?? item?.title ?? item?.header?.title;
+        if (id && typeof title === 'string' && title.trim()) found.set(String(id), clip(title.trim(), 60));
+      }
+    }
+  } catch {
+    /* 列表拿不到不是错误，标题退回日志 */
+  }
+  const missing = ids.filter((id) => !found.has(id)).slice(0, 10);
+  for (const id of missing) {
+    const title = await readSessionTitle(ctx, id);
+    if (title) found.set(id, title);
+  }
+  return found;
+}
+
+/* 一个会话的后台任务，只读注册表视图。 */
+function jobsOf(ctx, sessionId) {
+  const jobs = serviceOf(ctx, 'jobs');
+  if (!jobs || typeof jobs.list !== 'function') return [];
+  try {
+    const rows = jobs.list(sessionId);
+    if (!Array.isArray(rows)) return [];
+    return rows.slice(0, 8).map((job) => {
+      const total = Number(job?.output?.total) || 0;
+      const earliest = Number(job?.output?.earliest) || 0;
+      return {
+        label: clip(String(job?.label ?? job?.kind ?? job?.id ?? '任务').replace(/\s+/g, ' ').trim(), 70),
+        status: String(job?.status ?? ''),
+        /* 环窗口里还留着的那段才是驻留的；total 是写出去过的总量。 */
+        retained: Math.max(0, total - earliest),
+        since: job?.startedAt ?? null,
+      };
+    });
+  } catch {
+    return [];
+  }
+}
+
+async function memoryPayload(ctx, home) {
+  if (memoryCache.body && Date.now() - memoryCache.at < MEMORY_TTL_MS) return memoryCache.body;
+  const base = healthPayload(home);
+  let snap = null;
+  try {
+    snap = sessionFootprint(home, { limit: 14 });
+  } catch {
+    snap = null;
+  }
+  const open = Array.isArray(snap?.open) ? snap.open : [];
+  const titles = await sessionTitles(ctx, open.map((row) => row.id));
+  const body = buildMemory({ base, footprint: snap, titles, jobsOf: (id) => jobsOf(ctx, id) });
+  memoryCache.at = Date.now();
+  memoryCache.body = body;
+  return body;
+}
+
 async function handoffOne(ctx, { home, state, sessions, call, sourceId, current, knownIdle = false, args }) {
   /* 转世的前提是原会话已经收尾。别人还在跑的时候转世，旧回合会和接手的新会话同时写同一份
    * 工作，旧回合还会在归档后被腰斩（可能留下悬空 tool_calls）。自己转自己例外：当前这一轮
@@ -590,7 +665,9 @@ async function handoffMany(ctx, { home, state, sessions, call, current, args }) 
     && item.archived !== true);
   if (!rows.length) return '没有可转世的会话：除了当前这个，其余都在跑或已经归档。';
   const picked = rows.slice(0, limit);
-  const listed = picked.map((item) => `- ${item.sessionId}${item.title ? `（${clip(String(item.title), 30)}）` : ''}`);
+  /* 标题在 projections 里，顶层没有这个字段。 */
+  const titleOf = (item) => item?.projections?.values?.title || '';
+  const listed = picked.map((item) => `- ${item.sessionId}${titleOf(item) ? `（${clip(String(titleOf(item)), 30)}）` : ''}`);
   if (args?.dryRun !== false) {
     return [
       `可以转世 ${rows.length} 个会话，这次先只列不动，挑前 ${picked.length} 个：`,
@@ -732,9 +809,38 @@ export function apply(ctx, config = {}) {
         return () => {};
       }
       badgeState.mounted = true;
+      /* 点开圈才走的第二段路由，与圈同生共死。结果按 15 秒缓存。 */
+      let disposeBreakdown = null;
+      try {
+        disposeBreakdown = server.register({
+          kind: 'exact',
+          path: '/lifeguard/memory',
+          handler: async (req, res) => {
+            let body = '{"enabled":false}';
+            try {
+              body = JSON.stringify(await memoryPayload(scope, home));
+            } catch {
+              /* 读失败就回空表，界面上是「读数还没到」，不是错误弹窗 */
+            }
+            try {
+              res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+              res.end(body);
+            } catch {
+              /* the socket went away before we answered */
+            }
+          },
+        });
+      } catch (error) {
+        log(`内存构成未挂上：${error?.message ?? error}`);
+      }
       return () => {
         try {
           if (typeof dispose === 'function') dispose();
+        } catch {
+          /* already released */
+        }
+        try {
+          if (typeof disposeBreakdown === 'function') disposeBreakdown();
         } catch {
           /* already released */
         }
