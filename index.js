@@ -80,7 +80,6 @@ const HANDOFF_MAX_TOKENS = 8000;
 const HANDOFF_TEXT_MAX = 40000;
 const HANDOFF_LLM_MAX_PCT = 85;
 /* 批量转世做到这个占用率就停：转世自己也要读记录、建会话，堆越满越不值得再叠。 */
-const BATCH_STOP_PCT = 92;
 
 /** 优先用自带的构造器（带 id 和来源），解析不到就用最小结构。 */
 function userMessage(text) {
@@ -598,35 +597,19 @@ async function handoffMany(ctx, { home, state, sessions, call, current, args }) 
       `可以转世 ${rows.length} 个会话，这次先只列不动，挑前 ${picked.length} 个：`,
       ...listed,
       '确认要转世就再调一次，带 all: true、dryRun: false。',
-      '批量默认用自动摘要，省 token 也省堆；想让模型读懂再写交接单，就单独给那个会话传 sessionId。',
+      '点名转世时默认用自动摘要，省 token 也省堆；要模型读懂再写交接单就传 llm: true。',
       '内存只有重启才拿得回来：转世不会当场把堆降下来。',
     ].join('\n');
   }
-  const done = [];
-  const failed = [];
-  for (const item of picked) {
-    const pct = healthPayload(home).pct;
-    if (pct >= BATCH_STOP_PCT) {
-      failed.push(`剩下的没做：内存已到 ${pct.toFixed(0)}%，再转世只会更冒险。`);
-      break;
-    }
-    const one = await handoffOne(ctx, {
-      home,
-      state,
-      sessions,
-      call,
-      sourceId: item.sessionId,
-      current,
-      knownIdle: true,
-      args: { ...args, llm: args?.llm === true, title: undefined },
-    });
-    if (one.ok) done.push(`- ${one.childId} ← ${item.sessionId}（第 ${one.generation} 代）`);
-    else failed.push(`- ${item.sessionId}：${one.text}`);
-  }
-  const summary = [`批量转世：做成 ${done.length} 个${failed.length ? `，没做 ${failed.length} 个` : ''}。`, ...done];
-  if (failed.length) { summary.push('没做的：'); summary.push(...failed); }
-  summary.push('内存只有重启才拿得回来：重启前新会话可能各有一个未完成回合，重启后逐个打开发一句「继续」。');
-  return summary.join('\n');
+  /* 批量不替人决定：转世会在别的会话背后新开一个会话，那是用户点名之后才做的事，
+   * 一次调用自己挑十个去转，出了岔子也不该由模型兜。这里只给清单和该点的 id。 */
+  return [
+    `可以转世 ${rows.length} 个会话，但批量不自己动手。这次仍然只列清单：`,
+    ...listed,
+    picked.length < rows.length ? `其余 ${rows.length - picked.length} 个没展开，要的话自己看会话列表。` : '',
+    '要转哪个就点名：按 sessionId 一个个调（可以同时发几个），例如 sessionId: "会话 id"。',
+    '内存只有重启才拿得回来：转世不会当场把堆降下来。',
+  ].filter(Boolean).join('\n');
 }
 
 export function apply(ctx, config = {}) {
@@ -1218,7 +1201,7 @@ export function apply(ctx, config = {}) {
         brief: { type: 'boolean', description: '把交接单发给新会话，默认发；关掉只建空会话并把单子写盘' },
         force: { type: 'boolean', description: '会话还在跑也强行转世，默认拒绝' },
         llm: { type: 'boolean', description: '默认让模型读懂原会话再写交接单；关掉只做自动摘要，省资源但会丢判断' },
-        all: { type: 'boolean', description: '批量：把已经停下的会话一次转世，默认先只列清单不动' },
+        all: { type: 'boolean', description: '批量：只列出已经停下、能转世的会话清单；真转世要按 sessionId 点名' },
         dryRun: { type: 'boolean', description: '演练：只把交接单写到磁盘，不建新会话、不动原会话；用在内存还宽裕的时候' },
         limit: { type: 'number', description: '配合 all：一次最多做几个，默认 5，上限 10' },
       },
