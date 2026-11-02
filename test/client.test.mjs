@@ -38,8 +38,8 @@ test('the ring counts against the crash wall, not the nominal limit', async () =
   assert.equal(pressure.basis, 'crash');
   assert.equal(pressure.wallMB, 3529);
   assert.equal(pressure.pct, 75);
-  const margin = heapPressure(status, { crashMB: 0 });
-  assert.equal(margin.basis, 'margin');
-  assert.ok(margin.wallMB < 4192, '没有崩溃记录时也要留余量，不能拿名义上限当 100%');
+  const limit = heapPressure(status, { crashMB: 0 });
+  assert.equal(limit.basis, 'limit');
+  assert.equal(limit.wallMB, 4192, '没有崩溃点时，死点就是上限本身');
   assert.ok(heapPressure({ samples: 0 }, {}) && heapPressure({ samples: 0 }, {}).basis === 'none');
 });

@@ -9,7 +9,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
-import { compactRules, DEFAULT_HOME, importCorpus, maxCrashHeapMB, migrateLegacyStore, PROMPT_HEADER, readIncidents, readRules, readState, renderLorePrompt, scan, seedRules, storeDir, summarizeIncident, upsertRule } from './core.mjs';
+import { compactRules, DEFAULT_HOME, importCorpus, maxCrashHeapMB, migrateLegacyStore, PROMPT_HEADER, readIncidents, readRules, readState, renderLorePrompt, scan, seedRules, storeDir, summarizeIncident, upsertRule, VERSION } from './core.mjs';
 import { guardWrite, guardShell, preExecute, liveSurfaces, denial } from './defense.mjs';
 import { heapLine, heapPressure, noteCrashMB, startWatchdog, stopWatchdog, watchdogStatus } from './watchdog.mjs';
 import { DEFAULT_BUDGET_MB, SWEEP_EVERY_MS, maybeSweep } from './tmp.mjs';
@@ -358,7 +358,7 @@ async function handoffOne(ctx, { home, state, sessions, call, sourceId, current,
     return {
       ok: false,
       text: [
-        `内存不够，先别转世：堆 ${room.live.heapMB} MB，墙 ${room.wallMB} MB（${room.basis === 'crash' ? '崩溃点校准' : '按上限留余量'}）。`,
+        `内存不够，先别转世：堆 ${room.live.heapMB} MB，墙 ${room.wallMB} MB（${room.basis === 'crash' ? '崩溃点校准' : '这就是上限'}）。`,
         '转世本身要读旧会话的记录，这时候读会把宿主推过去。什么都没改。',
         '改法：现在就把要交接的进展写进工作区文件，然后 ⌘Q 退出 DSH 重开；重开后一次只恢复一个会话。',
       ].join('\n'),
@@ -527,16 +527,8 @@ async function handoffOne(ctx, { home, state, sessions, call, sourceId, current,
   } else if (briefSaved) {
     delivered = 'file';
   }
-  let archived = false;
-  const workspaces = serviceOf(ctx, 'workspaceController');
-  if (workspaces && typeof workspaces.archiveSession === 'function') {
-    try {
-      await workspaces.archiveSession({ sessionId: sourceId }, call);
-      archived = true;
-    } catch (error) {
-      recordError(state, error);
-    }
-  }
+  /* 归档是人的动作：转世后由用户自己点，插件不碰列表状态。 */
+  const archived = false;
   let generation = 1;
   try {
     generation = generationOf(readLineage(home), sourceId);
@@ -558,7 +550,7 @@ async function handoffOne(ctx, { home, state, sessions, call, sourceId, current,
     !briefSaved ? `交接单没落盘（${briefPath || '写文件失败'}）：这次交接在重启后不算数，先解决磁盘问题再退出。` : '',
     briefSaved && delivered === 'message' ? '交接单已经发到新会话里，它会先回一句「收到」等你下一步。' : briefSaved ? `交接单已经写入 ${briefPath}，下次打开新会话时按它接着干。` : '',
     model ? `交接单由 ${model.provider}/${model.model} 整理，${brief.text.length} 字。` : `交接单是自动摘要，${brief.text.length} 字：${llmNote || '没开模型整理'}。`,
-    archived ? `原会话 ${sourceId} 已归档，需要细节时取消归档回看，不会删。` : `原会话 ${sourceId} 没有归档成功（工作区服务没接上），但记录都还在。`,
+    `原会话 ${sourceId} 留在列表里，归档与否你自己点，插件不动。`,
     attached ? '' : `新会话没挂进左侧列表（${attachNote}），重启后在列表里看不到它，要手动打开。`,
     '内存只有重启才拿得回来：重启前新会话可能有一个未完成回合，重启后打开它再发一句「继续」。',
     '血缘记在插件自己的记录里，改标题不会丢；要看链条用 lifeguard_lineage。',
@@ -628,7 +620,7 @@ async function handoffMany(ctx, { home, state, sessions, call, current, args }) 
       knownIdle: true,
       args: { ...args, llm: args?.llm === true, title: undefined },
     });
-    if (one.ok) done.push(`- ${one.childId} ← ${item.sessionId}（第 ${one.generation} 代）${one.archived ? '' : '，原会话没归档'}`);
+    if (one.ok) done.push(`- ${one.childId} ← ${item.sessionId}（第 ${one.generation} 代）`);
     else failed.push(`- ${item.sessionId}：${one.text}`);
   }
   const summary = [`批量转世：做成 ${done.length} 个${failed.length ? `，没做 ${failed.length} 个` : ''}。`, ...done];
@@ -1312,6 +1304,7 @@ export function apply(ctx, config = {}) {
       else installHooks();
       const info = defenseState();
       const lines = describeStatus(undefined, { installCheck: config.installCheck !== false && state.mode !== "off" });
+      lines.splice(1, 0, `版本 ${VERSION}`);
       const recent = recentDenials(state, limit);
       if (recent.length) {
         lines.push(`最近拒绝 ${recent.length} 条`);

@@ -18,17 +18,17 @@ test('a crash point near the running limit is the wall', () => {
 
 test('a crash point recorded under another runtime is not this wall', () => {
   const wall = wallFor({ limitMB: 6144, crashMB: 4037 });
-  assert.equal(wall.basis, 'margin');
-  assert.equal(wall.wallMB, Math.round(6144 * 0.85));
+  assert.equal(wall.basis, 'limit');
+  assert.equal(wall.wallMB, 6144, '别的上限下死过，不代表这个进程死在哪');
 });
 
-test('no crash history keeps the margin', () => {
-  assert.deepEqual(wallFor({ limitMB: 4192 }), { wallMB: 3563, limitMB: 4192, basis: 'margin' });
-  assert.equal(wallFor({ limitMB: 4192, crashMB: 0 }).basis, 'margin');
+test('without a crash point the limit itself is the wall', () => {
+  assert.deepEqual(wallFor({ limitMB: 4192 }), { wallMB: 4192, limitMB: 4192, basis: 'limit' });
+  assert.equal(wallFor({ limitMB: 4192, crashMB: 0 }).basis, 'limit');
 });
 
 test('an unknown limit degrades instead of dividing by zero', () => {
-  assert.deepEqual(wallFor({}), { wallMB: 0, limitMB: 0, basis: 'margin' });
+  assert.deepEqual(wallFor({}), { wallMB: 0, limitMB: 0, basis: 'none' });
 });
 
 test('levels come from the wall, not from the raw limit', () => {
@@ -59,16 +59,31 @@ test('an expensive step that would land on the wall is denied with the numbers',
   assert.equal(verdict.numbers.wallMB, 4037);
   assert.ok(verdict.numbers.projected > 4037);
   assert.match(verdict.reason, /上限 4192 MB/);
-  assert.match(verdict.reason, /先不要跑它/);
+  assert.match(verdict.reason, /压在墙上/);
 });
 
 test('the same step with room left runs', () => {
   assert.equal(admit(reading({ heapMB: 2000 }), { name: 'bash' }, { crashMB: 4037 }).ok, true);
 });
 
-test('a big read is refused once the heap is already at the wall, however small the step', () => {
-  const verdict = admit(reading({ heapMB: 3900 }), { name: 'web_fetch' }, { crashMB: 4037 });
-  assert.equal(verdict.ok, false);
+test('a step that still fits runs even with the heap at the wall', () => {
+  assert.equal(admit(reading({ heapMB: 3900 }), { name: 'web_fetch' }, { crashMB: 4037 }).ok, true);
+  assert.equal(admit(reading({ heapMB: 3800 }), { name: 'bash' }, { crashMB: 4037 }).ok, true);
+  assert.equal(admit(reading({ heapMB: 3900 }), { name: 'bash' }, { crashMB: 4037 }).ok, false);
+});
+
+test('other sessions keep working under the 8 GB regime', () => {
+  const live = reading({ heapMB: 6000, limitMB: 8384 });
+  for (const name of ['bash', 'read', 'edit', 'grep', 'web_fetch', 'lifeguard_handoff']) {
+    assert.equal(admit(live, { name }).ok, true, name);
+  }
+  /* 正常高水位不拦：只有这一步自己会越过 8384 MB 才拦。 */
+  for (const heapMB of [7000, 8000]) {
+    assert.equal(admit(reading({ heapMB, limitMB: 8384 }), { name: 'bash' }).ok, true, String(heapMB));
+  }
+  assert.equal(admit(reading({ heapMB: 7000, limitMB: 8384 }), { name: 'lifeguard_handoff' }).ok, true);
+  assert.equal(admit(reading({ heapMB: 8000, limitMB: 8384 }), { name: 'lifeguard_handoff' }).ok, false);
+  assert.equal(admit(reading({ heapMB: 8300, limitMB: 8384 }), { name: 'bash' }).ok, false);
 });
 
 test('session resume is priced as the most expensive core step', () => {

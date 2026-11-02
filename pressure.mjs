@@ -6,7 +6,8 @@
  * likely to add, does it still fit under the wall?
  *
  * The wall is not the raw heap limit. A heap limit is what V8 allows; the wall is where this host
- * has actually died, when a crash log proved that point, otherwise a margin under the limit.
+ * has actually died, when a crash log from this same regime proved that point, otherwise the heap
+ * limit itself: a step is stopped only when it would really cross into a crash.
  */
 
 import v8 from 'node:v8';
@@ -18,20 +19,38 @@ export function megabytes(bytes) {
   return Number.isFinite(value) && value > 0 ? Math.round(value / MEGABYTE) : 0;
 }
 
-/** The crash point only means something while it still sits near the limit this process runs at. */
+/** A recorded crash point describes this runtime only if it died close to its own limit. */
 export const WALL_CLOSENESS = 0.75;
 
 /**
- * @param {{limitMB?: number, crashMB?: number, margin?: number}} options
- * @returns {{wallMB: number, limitMB: number, basis: 'crash'|'margin'}}
+ * The wall is the point where the process really dies, which for V8 is the heap limit itself: at
+ * that size it cannot grow and aborts. Stopping earlier than that stops work that would have
+ * finished, so a guessed margin is only used when the limit is unknown.
+ *
+ * @param {{limitMB?: number, crashMB?: number}} options
+ * @returns {{wallMB: number, limitMB: number, basis: 'crash'|'limit'|'none'}}
  */
 export function wallFor(options = {}) {
   const limitMB = Math.max(0, Math.round(Number(options.limitMB) || 0));
   const crashMB = Math.max(0, Math.round(Number(options.crashMB) || 0));
-  const margin = Number.isFinite(options.margin) ? options.margin : 0.85;
-  const known = crashMB > 0 && (!limitMB || crashMB >= limitMB * WALL_CLOSENESS);
-  if (known) return { wallMB: crashMB, limitMB, basis: 'crash' };
-  return { wallMB: Math.round(limitMB * margin), limitMB, basis: 'margin' };
+  if (limitMB > 0) {
+    const crashCounts = crashMB > 0 && crashMB <= limitMB && crashMB >= limitMB * WALL_CLOSENESS;
+    return { wallMB: crashCounts ? crashMB : limitMB, limitMB, basis: crashCounts ? 'crash' : 'limit' };
+  }
+  if (crashMB > 0) return { wallMB: crashMB, limitMB: 0, basis: 'crash' };
+  return { wallMB: 0, limitMB: 0, basis: 'none' };
+}
+
+/**
+ * Warning lines are fractions of the wall and only ever colour a panel: they must never stop a
+ * step. Under a raised limit the old fixed 1800/2800 MB lines were crossed on every normal run, so
+ * the alarm latched forever and contradicted the numbers printed next to it.
+ */
+export function thresholdsFor(limitMB = 0, options = {}) {
+  const wallMB = wallFor({ limitMB, crashMB: options.crashMB ?? 0 }).wallMB;
+  const warnMB = options.warnMB ?? (wallMB ? Math.round(wallMB * 0.75) : 1800);
+  const criticalMB = options.criticalMB ?? (wallMB ? Math.round(wallMB * 0.9) : 2800);
+  return { warnMB, criticalMB, wallMB };
 }
 
 /** Tools that must keep working while the heap is full: they are how a person inspects and fixes it. */
@@ -116,7 +135,7 @@ export function levelOf(reading, options = {}) {
  * Should this step run? Deny only when the step is expensive and it would land on the wall.
  * @param {{heapMB?: number, limitMB?: number, rssMB?: number}} reading
  * @param {{name?: string, arguments?: any}} exec
- * @param {{crashMB?: number, margin?: number}} options
+ * @param {{crashMB?: number}} options
  * @returns {{ok: true, exempt?: boolean} | {ok: false, rule: string, reason: string, numbers: object}}
  */
 export function admit(reading, exec, options = {}) {
@@ -125,24 +144,22 @@ export function admit(reading, exec, options = {}) {
   const { wallMB, limitMB, basis } = wallFor({
     limitMB: reading?.limitMB || options.limitMB,
     crashMB: options.crashMB,
-    margin: options.margin,
   });
   if (!wallMB) return { ok: true };
   const heapMB = Math.max(0, Number(reading?.heapMB) || 0);
   const costMB = costOf(name);
   const projected = heapMB + costMB;
-  const near = levelOf({ heapMB }, { wallMB }).level;
   const crosses = projected > wallMB;
-  /* At the stop level even a mid-sized read can be the allocation that ends the process; only
-   * the genuinely small steps (a todo, a message) are still worth allowing. */
-  const crushed = near === 'stop' && costMB >= 40;
-  if (!crosses && !crushed) return { ok: true };
+  /* Deny only the step whose own estimate lands past the point where the process would die. Any
+   * earlier line stops work that would have finished, and it stops it for every session on the
+   * host, including the ones that caused no memory pressure at all. */
+  if (!crosses) return { ok: true };
 
   const headroom = Math.max(0, wallMB - heapMB);
   const reason = [
-    `堆 ${heapMB} MB，上限 ${limitMB || '未知'} MB，墙 ${wallMB} MB（${basis === 'crash' ? '崩溃点校准' : '按上限留余量'}）。`,
-    `这一步（${name || '未命名工具'}）预计还要 ${costMB} MB，落地后约 ${projected} MB，${crosses ? '会越过墙' : '已经在墙边'}。`,
-    `现在只剩 ${headroom} MB 余量，先不要跑它。`,
+    `堆 ${heapMB} MB，上限 ${limitMB || '未知'} MB，墙 ${wallMB} MB（${basis === 'crash' ? '崩溃点校准' : '这就是上限，越过去进程就死'}）。`,
+    `这一步（${name || '未命名工具'}）预计还要 ${costMB} MB，落地后约 ${projected} MB，会比墙还高。`,
+    `现在只剩 ${headroom} MB 余量，跑它就压在墙上。`,
     '改法：先把当前进展写成交接单（lifeguard_handoff 的 dryRun 先看清要交接什么），确认落盘后再退出 DSH 重开；重开后一次只恢复一个会话。',
     '要只是看一眼数字，lifeguard_guard、lifeguard_scan 这类诊断工具不会被拦。',
   ].join('\n');

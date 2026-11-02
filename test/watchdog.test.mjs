@@ -5,6 +5,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createWatchdog, heapLine, heapPressure, heapWarning } from '../watchdog.mjs';
+import { thresholdsFor } from '../pressure.mjs';
 
 function driven(values, stepMs = 20_000) {
   let index = 0;
@@ -15,6 +16,10 @@ function driven(values, stepMs = 20_000) {
       return { heapUsed: heapMB * 1024 * 1024, rss: (heapMB + 400) * 1024 * 1024 };
     },
     now: () => clock,
+    /* Fixed lines, so the latch mechanics are asserted without depending on the runner's own
+     * heap limit; the limit-derived thresholds get their own test below. */
+    warnMB: 1800,
+    criticalMB: 2800,
   });
   return {
     watcher,
@@ -111,16 +116,31 @@ test('an alarm keeps warning even after the heap drops back', () => {
   assert.match(heapWarning(run.watcher.status()), /内存告警/);
 });
 
+test('warning lines follow the running limit instead of fixed MB', () => {
+  const big = thresholdsFor(8384);
+  assert.equal(big.wallMB, 8384);
+  assert.equal(big.warnMB, 6288);
+  assert.equal(big.criticalMB, 7546);
+  const small = thresholdsFor(4096);
+  assert.equal(small.wallMB, 4096);
+  assert.equal(small.warnMB, 3072);
+  assert.equal(small.criticalMB, 3686);
+  assert.equal(thresholdsFor(0).warnMB, 1800, 'no limit known keeps the old conservative line');
+});
+
 test('percent is against the wall that kills, not the nominal limit', () => {
   const run = driven([2698, 3529]);
   run.tick();
   const live = run.watcher.status();
-  assert.equal(heapPressure(live, { crashMB: 3529 }).pct, 76);
-  assert.equal(heapPressure({ ...live, heapMB: 3529 }, { crashMB: 3529 }).pct, 100);
-  /* No crash on record: fall back to a 15% margin under the reported limit. */
+  /* A crash point only counts for the runtime it was measured in: heap limit 3600 here. */
+  assert.equal(heapPressure(live, { crashMB: 3529, limitMB: 3600 }).pct, 76);
+  assert.equal(heapPressure({ ...live, heapMB: 3529 }, { crashMB: 3529, limitMB: 3600 }).pct, 100);
+  /* 别的上限下的崩溃点不适用于这个进程：死点就是这次的上限。 */
+  assert.equal(heapPressure({ ...live, heapMB: 3529 }, { crashMB: 3529, limitMB: 8192 }).basis, 'limit');
+  assert.equal(heapPressure({ ...live, heapMB: 3529 }, { crashMB: 3529, limitMB: 8192 }).wallMB, 8192);
   const guess = heapPressure(live, { limitMB: 4192 });
-  assert.equal(guess.basis, 'margin');
-  assert.equal(guess.wallMB, 3563);
+  assert.equal(guess.basis, 'limit');
+  assert.equal(guess.wallMB, 4192);
 });
 
 /* 100% 必须始终等于「死过一次的堆」：状态行和百分比共用同一个 crashMB，不各算一套。 */
@@ -130,7 +150,8 @@ test('死亡堆进了状态行：正常时不写崩溃点，越过 100% 才提�
   run.tick();
   const watcher = run.watcher;
   noteCrashMB(3566);
-  const status = { ...watcher.status(), crashMB: 3566 };
+  /* Limit recorded with the crash: the wall is this runtime's own death heap. */
+  const status = { ...watcher.status(), crashMB: 3566, limitMB: 4189 };
   assert.equal(heapPressure(status).pct, 101);
   assert.equal(heapPressure(status).basis, 'crash');
   assert.doesNotMatch(heapLine(status), /崩溃点|按上限/);
@@ -138,4 +159,11 @@ test('死亡堆进了状态行：正常时不写崩溃点，越过 100% 才提�
   const calm = { ...status, heapMB: 1800 };
   assert.doesNotMatch(heapLine(calm), /注意随时可能崩溃/);
   noteCrashMB(0);
+});
+
+test('a host started without the 8 GB wrapper says so', () => {
+  const line = heapLine({ samples: 3, heapMB: 900, peakMB: 950, limitMB: 4096, wallMB: 3482, crashMB: 0 });
+  assert.match(line, /这次堆上限 4096 MB，不是启动器的 8 GB/);
+  assert.match(heapLine({ samples: 3, heapMB: 900, peakMB: 950, limitMB: 8384 }), /上限 8384 MB/);
+  assert.doesNotMatch(heapLine({ samples: 3, heapMB: 900, peakMB: 950, limitMB: 8384 }), /不是启动器/);
 });

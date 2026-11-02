@@ -8,15 +8,16 @@
  * sample is dropped. Crossing the critical line records one alarm that survives the crash, so the
  * next run knows this plugin set has already been to the edge.
  */
+import fs from 'node:fs';
 import v8 from 'node:v8';
 import { appendJsonl, paths, DEFAULT_HOME } from './core.mjs';
 import { recordFootprint } from './lib/sessions.mjs';
-import { wallFor } from './pressure.mjs';
+import { thresholdsFor, wallFor } from './pressure.mjs';
 
 const DEFAULTS = {
   intervalMs: 20_000,
-  warnMB: 1800,
-  criticalMB: 2800,
+  warnMB: null,
+  criticalMB: null,
   releaseRatio: 0.6,
   keep: 180,
   persistEveryMs: 60_000,
@@ -59,10 +60,11 @@ export function createWatchdog(options = {}) {
       peakMB = Math.max(peakMB, heapMB);
       ring.push({ t: new Date(stamp).toISOString(), heapMB, rssMB, limitMB });
       if (ring.length > config.keep) ring.splice(0, ring.length - config.keep);
-      if (heapMB >= config.criticalMB) {
+      const limits = thresholdsFor(limitMB, { warnMB: config.warnMB, criticalMB: config.criticalMB });
+      if (heapMB >= limits.criticalMB) {
         if (!alarm || alarm.released) alarm = { at: new Date(stamp).toISOString(), heapMB, released: false };
         else alarm.heapMB = Math.max(alarm.heapMB, heapMB);
-      } else if (alarm && heapMB < config.warnMB * config.releaseRatio) {
+      } else if (alarm && heapMB < limits.warnMB * config.releaseRatio) {
         alarm = { ...alarm, released: true };
       }
       lastTick = stamp;
@@ -96,8 +98,7 @@ export function createWatchdog(options = {}) {
       limitMB: latest?.limitMB ?? 0,
       trendMBPerMin,
       since: new Date(startedAt).toISOString(),
-      warnMB: config.warnMB,
-      criticalMB: config.criticalMB,
+      ...thresholdsFor(latest?.limitMB ?? 0, { warnMB: config.warnMB, criticalMB: config.criticalMB }),
       alarm: alarm ? { ...alarm } : null,
       lastTick: picks ? new Date(lastTick).toISOString() : null,
     };
@@ -107,6 +108,24 @@ export function createWatchdog(options = {}) {
 }
 
 let active = null;
+
+/**
+ * Keep the on-disk sample log bounded. It is a debugging aid: at one sample a minute it would
+ * otherwise grow without limit on a machine that never restarts. `keepPersisted` decides the size.
+ */
+function trimHeapLog(home, keep) {
+  const limit = Math.max(200, Math.round(Number(keep) || 0));
+  try {
+    const file = paths(home).heap;
+    const body = fs.readFileSync(file, 'utf8').split('\n').filter((line) => line.trim() !== '');
+    if (body.length <= limit * 2) return 0;
+    const kept = body.slice(-limit);
+    fs.writeFileSync(file, `${kept.join('\n')}\n`);
+    return body.length - kept.length;
+  } catch {
+    return 0;
+  }
+}
 
 function persistSample(home, sample) {
   try {
@@ -130,6 +149,7 @@ export function startWatchdog(home = DEFAULT_HOME, options = {}) {
     footprint: (stamp) => recordFootprint(home, { now: stamp }),
   });
   active = watcher;
+  trimHeapLog(home, watcher.config.keepPersisted);
   /* First sample immediately: a restart after a crash should show the new baseline in the card. */
   watcher.sampleOnce();
   /* One baseline footprint right away: a crash inside the first sampling minute still has a
@@ -179,8 +199,9 @@ export function stopWatchdog() {
  */
 export function heapWarning(status = watchdogStatus(), options = {}) {
   if (!status?.samples) return '';
-  const warnMB = options.warnMB ?? status.warnMB ?? 1800;
-  const criticalMB = options.criticalMB ?? status.criticalMB ?? 2800;
+  const derived = thresholdsFor(status.limitMB ?? 0, { warnMB: options.warnMB ?? status.warnMB, criticalMB: options.criticalMB ?? status.criticalMB });
+  const warnMB = derived.warnMB;
+  const criticalMB = derived.criticalMB;
   const alarmMB = status.alarm && !status.alarm.released ? status.alarm.heapMB : 0;
   const hot = Math.max(status.heapMB ?? 0, alarmMB);
   if (hot < warnMB) return '';
@@ -190,9 +211,9 @@ export function heapWarning(status = watchdogStatus(), options = {}) {
 
 /**
  * How close this process is to the wall that actually kills, in percent. `heap_size_limit` is only
- * an upper bound — V8 aborts when old space runs out first, which is earlier — so 100% has to mean
- * "dies here". Calibrate against the heap a real OOM was recorded at on this machine; with no
- * history, keep a 15% margin. The wall differs per machine, the calibration does not.
+ * the point where it dies: V8 aborts when it cannot grow past its own limit, so the reported limit
+ * is the wall unless a crash log from the same regime recorded an earlier death. 100% therefore
+ * means "dies here", not "close enough to worry".
  */
 export function heapPressure(status = watchdogStatus(), options = {}) {
   if (!status?.samples) return { pct: 0, wallMB: 0, basis: 'none' };
@@ -201,7 +222,6 @@ export function heapPressure(status = watchdogStatus(), options = {}) {
   const { wallMB, basis } = wallFor({
     limitMB: Number(options.limitMB ?? status.limitMB ?? 0),
     crashMB: Number(options.crashMB ?? status.crashMB ?? 0),
-    margin: options.margin,
   });
   const pct = wallMB > 0 ? Math.round(((status.heapMB ?? 0) / wallMB) * 100) : 0;
   return { pct, wallMB, basis };
@@ -214,5 +234,18 @@ export function heapLine(status = watchdogStatus()) {
   const alarm = status.alarm && !status.alarm.released ? `；上次运行到过 ${status.alarm.heapMB} MB（${status.alarm.at}）` : '';
   const pressure = heapPressure(status);
   const over = pressure.pct >= 100 ? '\n注意随时可能崩溃' : '';
-  return `内存观测 ${status.heapMB} MB（峰值 ${status.peakMB} MB${trend}，上限 ${status.limitMB} MB）${alarm}${over}`;
+  /* Only when the wall is inside half an hour: earlier than that the number is noise, and a line
+   * repeated in every status card has to earn its length. */
+  const rate = Number(status.trendMBPerMin) || 0;
+  let eta = '';
+  if (!over && rate > 0 && pressure.pct < 100) {
+    const left = Math.ceil((pressure.wallMB - (status.heapMB ?? 0)) / rate);
+    if (left > 0 && left <= 30) eta = `\n按这个增速约 ${left} 分钟到 ${pressure.wallMB} MB，先把会话收尾重启`;
+  }
+  /* The 3.5–4 GB deaths were not a heap wall but a process started without the 8 GB wrapper:
+   * its own default ceiling ended it. The limit is measurable, so say it instead of guessing. */
+  const launcher = status.limitMB > 0 && status.limitMB < 6000
+    ? `\n这次堆上限 ${status.limitMB} MB，不是启动器的 8 GB，到 4 GB 左右就会死：重启用 启动DSH-6G.command`
+    : '';
+  return `内存观测 ${status.heapMB} MB（峰值 ${status.peakMB} MB${trend}，上限 ${status.limitMB} MB）${alarm}${over}${eta}${launcher}`;
 }

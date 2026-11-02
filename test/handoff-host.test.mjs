@@ -140,7 +140,7 @@ test('模型给了完整交接单时，新会话收到的是模型写的那份',
   assert.match(text, /整理：deepseek\/v4/);
   assert.equal(result.llm, 'deepseek/v4');
   assert.match(result.text, /交接单由 deepseek\/v4 整理/);
-  assert.equal(calls.archive.length, 1);
+  assert.equal(calls.archive.length, 0);
   assert.equal(calls.rename[0].title.endsWith(' · 转世'), true);
 });
 
@@ -156,7 +156,7 @@ test('模型失败时退回自动摘要，转世照样完成', async () => {
   assert.equal(result.llm, '');
   assert.match(result.text, /自动摘要/);
   assert.match(result.text, /upstream 502/);
-  assert.equal(calls.archive.length, 1);
+  assert.equal(calls.archive.length, 0);
 });
 
 test('模型收到非正常收尾也算失败，不把它当交接单', async () => {
@@ -270,7 +270,7 @@ test('确认后按上限一个个转世，跑着的和当前会话都跳过', as
   ];
   const { result, calls } = await runBatch({ items, args: { dryRun: false, limit: 2 } });
   assert.equal(calls.create.length, 2);
-  assert.equal(calls.archive.length, 2);
+  assert.equal(calls.archive.length, 0);
   assert.match(result.text, /做成 2 个/);
   assert.match(result.text, /child-1 ← s-1/);
   assert.match(result.text, /child-2 ← s-2/);
