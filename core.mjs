@@ -17,7 +17,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 import { correlateIncidents, crashLoops } from './lib/attribute.mjs';
 import { footprintBefore } from './lib/sessions.mjs';
 
-export const VERSION = '0.7.7';
+export const VERSION = '0.7.8';
 export const DEFAULT_HOME = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
 
 /* 新数据目录；旧版目录名只用于一次性迁移与读取回退。 */
@@ -581,13 +581,23 @@ export function readIncidents(home = DEFAULT_HOME) {
   return readJsonl(storeReadFile(paths(home).incidents, home));
 }
 
-/* 本机最高的一次致命堆：崩溃日志里所有 OOM 的 heap 取最大。纯函数，横竖都能测；
- * Windows/Linux/macOS 只依赖签名文本，不碰路径分隔符。 */
-export function maxCrashHeapMB(incidents = []) {
+/* 本机最高的一次致命堆：只认「同一档上限」下死过的记录。
+ * 上限换过之后，旧档的死亡点对新档没有任何意义（4 GB 时代死在 3.9 GB，不代表 8 GB 也会死在那儿），
+ * 所以取样要带上当时的 limitMB：记录里没写上限的一律不采信。纯函数，横竖都能测。 */
+export function maxCrashHeapMB(incidents = [], options = {}) {
+  const want = Number(options.limitMB) > 0 ? Number(options.limitMB) : 0;
   let wall = 0;
   for (const incident of incidents) {
     const match = /heap\s+(\d+)\s*MB/.exec(String(incident?.signature ?? ''));
     const heap = match ? Number(match[1]) : 0;
+    if (!heap) continue;
+    const recorded = Number(incident?.limitMB) || 0;
+    if (want) {
+      /* 同一档才作数；记录没写上限就无法确认它在哪一档，宁可不采信。 */
+      if (!recorded || Math.abs(recorded - want) > want * 0.02) continue;
+    } else if (!recorded) {
+      continue;
+    }
     if (heap > wall) wall = heap;
   }
   return wall;

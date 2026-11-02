@@ -9,7 +9,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
-import { compactRules, DEFAULT_HOME, importCorpus, maxCrashHeapMB, migrateLegacyStore, PROMPT_HEADER, readIncidents, readRules, readState, renderLorePrompt, scan, seedRules, storeDir, summarizeIncident, upsertRule, VERSION } from './core.mjs';
+import { compactRules, DEFAULT_HOME, importCorpus, maxCrashHeapMB, migrateLegacyStore, paths, PROMPT_HEADER, readIncidents, readRules, readState, renderLorePrompt, scan, seedRules, storeDir, summarizeIncident, upsertRule, VERSION } from './core.mjs';
 import { guardWrite, guardShell, preExecute, liveSurfaces, denial } from './defense.mjs';
 import { heapLine, heapPressure, noteCrashMB, startWatchdog, stopWatchdog, watchdogStatus } from './watchdog.mjs';
 import { DEFAULT_BUDGET_MB, SWEEP_EVERY_MS, maybeSweep } from './tmp.mjs';
@@ -248,45 +248,22 @@ function liveHeaderOf(ctx, sessionId) {
   }
 }
 
-/* The wall that actually kills this machine, read from its own crash log: V8 dies in old space
- * before the nominal limit, so the badge counts against the observed death heap, not the limit. */
-let crashWallCache = null;
-/* 崩溃点必须自己跟着日志变：文件没动就复用（一次 stat，不读盘），动了或超过一分钟就重算。
- * 换了机器、换了崩溃记录、或另一个宿主刚写进新的一条，圈最多一分钟就跟上。 */
-const CRASH_WALL_TTL_MS = 60_000;
-let crashWallStamp = -1;
-let crashWallAt = 0;
-/* 底部状态圈的自检：路由到底挂上没有，只有这里知道。不进 prompt，只在 lifeguard_guard 里显示，
+/* The wall that actually kills this machine, read from its own crash log: a crash that happened
+ * under this same heap limit is worth listening to; one from a different limit says nothing. */
+/* 底部状态圈的自检/* 底部状态圈的自检：路由到底挂上没有，只有这里知道。不进 prompt，只在 lifeguard_guard 里显示，
  * 免得「圈没数据」和「圈坏了」永远分不出来。 */
 const badgeState = { mounted: false, path: '/lifeguard/health', error: '' };
 /* 跨平台：Windows/Linux/macOS 都只看 mtimeMs；读不到（文件还没建、权限）就当没有。 */
-function statMtime(file) {
+/* 崩溃死亡点只按「和现在这一档上限对得上」的记录算；不对档的由 wallFor 自己筛掉，
+ * 所以这里不做缓存——缓存只会让换档后还拿着旧数字，多一层状态多一层错。 */
+function crashWallMB(home, limitMB = 0) {
+  const limit = Number(limitMB) > 0 ? Number(limitMB) : 0;
   try {
-    return fs.statSync(file).mtimeMs;
+    return maxCrashHeapMB(readIncidents(home), { limitMB: limit });
   } catch {
+    /* 存档读不出来不该把徽章带崩 */
     return 0;
   }
-}
-
-function crashWallMB(home) {
-  let stamp = 0;
-  try {
-    stamp = statMtime(paths(home).incidents);
-  } catch {
-    stamp = 0;
-  }
-  const fresh = crashWallCache !== null && stamp === crashWallStamp && Date.now() - crashWallAt < CRASH_WALL_TTL_MS;
-  if (fresh) return crashWallCache;
-  let wall = 0;
-  try {
-    wall = maxCrashHeapMB(readIncidents(home));
-  } catch {
-    /* an unreadable store must not take down the badge */
-  }
-  crashWallCache = wall;
-  crashWallStamp = stamp;
-  crashWallAt = Date.now();
-  return wall;
 }
 
 /* Is there room to read a large session at all? 90% of the wall is the point where the read
@@ -294,7 +271,7 @@ function crashWallMB(home) {
 const HANDOFF_STOP_RATIO = 0.9;
 function handoffRoom(home) {
   const live = readLive();
-  const { wallMB, basis } = wallFor({ limitMB: live.limitMB, crashMB: crashWallMB(home) });
+  const { wallMB, basis } = wallFor({ limitMB: live.limitMB, crashMB: crashWallMB(home, live.limitMB) });
   const ratio = wallMB > 0 ? live.heapMB / wallMB : 0;
   return { ok: ratio < HANDOFF_STOP_RATIO, ratio, wallMB, basis, live };
 }
@@ -304,8 +281,8 @@ function healthPayload(home) {
   try {
     const status = watchdogStatus();
     /* 状态行和这里必须是同一把尺子：读完历史先告诉观测层，100% 才始终等于「死过一次的堆」。 */
-    noteCrashMB(crashWallMB(home));
-    const pressure = heapPressure(status, { limitMB: status?.limitMB, crashMB: crashWallMB(home) });
+    noteCrashMB(crashWallMB(home, status?.limitMB));
+    const pressure = heapPressure(status, { limitMB: status?.limitMB, crashMB: crashWallMB(home, status?.limitMB) });
     const row = { enabled: true, pct: pressure.pct, wallMB: pressure.wallMB, basis: pressure.basis };
     Object.assign(row, { heapMB: status?.heapMB ?? 0, peakMB: status?.peakMB ?? 0, limitMB: status?.limitMB ?? 0 });
     return row;
@@ -405,48 +382,69 @@ async function handoffOne(ctx, { home, state, sessions, call, sourceId, current,
     };
   }
   const cwd = inspection?.meta?.cwd;
-  let child;
+  /* 新会话要落在原会话所在的项目下：侧栏分组只看 workspace 的 sessionIds，传 cwd 只会建出一个
+   * 不属于任何项目的会话，转世完在项目里看不到。所以先认出原会话属于哪个项目，按 workspaceId 建。 */
+  let parentWorkspace = null;
+  let parentWorkspaceId = '';
   try {
-    child = await sessions.create(cwd ? { cwd } : {}, call);
-  } catch (first) {
-    /* 老会话的 cwd 可能已经不在任何工作区里；建不出来就退回默认工作区，别让转世卡在参数上。 */
+    const registry = serviceOf(ctx, 'workspaceRegistry');
+    const list = registry && typeof registry.list === 'function' ? registry.list() : [];
+    if (Array.isArray(list)) parentWorkspace = list.find((ws) => workspaceHasSession(ws, sourceId)) ?? null;
+    parentWorkspaceId = String(propOf(parentWorkspace, 'id') ?? '') || '';
+  } catch (error) {
+    log(`认不出原会话的项目：${error?.message ?? error}`);
+  }
+  const seeds = [];
+  if (parentWorkspaceId) seeds.push({ workspaceId: parentWorkspaceId });
+  if (cwd) seeds.push({ cwd });
+  seeds.push({});
+  let child;
+  let firstError = null;
+  for (const seed of seeds) {
     try {
-      child = await sessions.create({}, call);
+      child = await sessions.create(seed, call);
+      break;
     } catch (error) {
-      return { ok: false, text: `新会话没建起来：${error?.message ?? first?.message ?? error}。原会话没动，可以重试。` };
+      firstError = firstError ?? error;
+      /* 建不出来就退回下一档；最后一档也失败才报错。 */
     }
+  }
+  if (!child) {
+    return { ok: false, text: `新会话没建起来：${firstError?.message ?? firstError ?? '会话服务没有返回'}。原会话没动，可以重试。` };
   }
   const childId = child?.sessionId;
   if (typeof childId !== 'string' || !childId) return { ok: false, text: '没有拿到新会话 id，原会话没动，可以重试。' };
-  /* 新会话默认不进左侧列表：建出来就挂到它 cwd 所属的工作区，转世完就能直接点开。
-   * 挂不上不算转世失败，只是要告诉人一声。 */
-  let attached = false;
-  let attachNote = cwd ? '没有对应的工作区' : '原会话没有 cwd';
-  try {
-    const registry = serviceOf(ctx, 'workspaceRegistry');
-    const ws = registry && typeof registry.resolveByPath === 'function' && cwd ? await registry.resolveByPath(cwd) : null;
-    if (ws && typeof ws.attachSession === 'function') {
-      await ws.attachSession(childId);
-      /* attachSession 落盘成功不等于列表里能看见：工作区的 sessionIds 会用启动时建的
-       * cwd 索引再过滤一遍，新会话还没进那张表时会被静默滤掉。回读一次，不认就补索引。 */
-      attached = workspaceHasSession(ws, childId);
-      if (!attached && typeof registry.indexHeader === 'function') {
-        const header = liveHeaderOf(ctx, childId);
-        if (header) {
-          try {
-            await registry.indexHeader(header);
-          } catch (error) {
-            log(`新会话的 cwd 索引没补上：${error?.message ?? error}`);
+  /* workspaceId 那条路由宿主自己 attach；真挂上了就不必再补，没挂上才走下面这条补救链路。 */
+  let attached = workspaceHasSession(parentWorkspace, childId);
+  let attachNote = attached ? '' : parentWorkspaceId ? '项目里没有收下这个会话' : cwd ? '没有对应的工作区' : '原会话没有 cwd';
+  if (!attached) {
+    try {
+      const registry = serviceOf(ctx, 'workspaceRegistry');
+      const ws = parentWorkspace
+        ?? (registry && typeof registry.resolveByPath === 'function' && cwd ? await registry.resolveByPath(cwd) : null);
+      if (ws && typeof ws.attachSession === 'function') {
+        await ws.attachSession(childId);
+        /* attachSession 落盘成功不等于列表里能看见：工作区的 sessionIds 会用启动时建的
+         * cwd 索引再过滤一遍，新会话还没进那张表时会被静默滤掉。回读一次，不认就补索引。 */
+        attached = workspaceHasSession(ws, childId);
+        if (!attached && typeof registry.indexHeader === 'function') {
+          const header = liveHeaderOf(ctx, childId);
+          if (header) {
+            try {
+              await registry.indexHeader(header);
+            } catch (error) {
+              log(`新会话的 cwd 索引没补上：${error?.message ?? error}`);
+            }
+            attached = workspaceHasSession(ws, childId);
           }
-          attached = workspaceHasSession(ws, childId);
         }
+        attachNote = attached ? '' : '工作区的 cwd 索引里没有它，列表会把它滤掉';
+        if (!attached) log(`新会话 ${childId} 挂上了但列表里看不到：${attachNote}`);
       }
-      attachNote = attached ? '' : '工作区的 cwd 索引里没有它，列表会把它滤掉';
-      if (!attached) log(`新会话 ${childId} 挂上了但列表里看不到：${attachNote}`);
+    } catch (error) {
+      attachNote = String(error?.message ?? error);
+      log(`新会话没挂进工作区：${attachNote}`);
     }
-  } catch (error) {
-    attachNote = String(error?.message ?? error);
-    log(`新会话没挂进工作区：${attachNote}`);
   }
   /* 交接单由模型读懂原会话后写；调用记在新会话名下（它已经建好），原会话的记录不被改写。
    * 任何一步失败都退回确定性那份——转世本身不能因为整理失败而失败。 */
@@ -566,6 +564,7 @@ async function handoffOne(ctx, { home, state, sessions, call, sourceId, current,
     generation,
     delivered,
     archived,
+    attached,
     /* 没写下去就不报路径：路径存在感会让人以为硬盘上有东西。 */
     briefPath: briefSaved ? briefPath : undefined,
     briefChars: brief.text.length,
@@ -660,7 +659,8 @@ export function apply(ctx, config = {}) {
    * "the host vanished" into "the heap was at 2.9 GB and climbing" while the session is still alive. */
   ctx.effect(() => {
     try {
-      noteCrashMB(crashWallMB(home));
+      const live = readLive();
+      noteCrashMB(crashWallMB(home, live.limitMB));
       startWatchdog(home);
     } catch (error) {
       log(`内存观测未启动：${error?.message ?? error}`);
@@ -1072,7 +1072,8 @@ export function apply(ctx, config = {}) {
             /* A rule wasn't broken — there is simply no room left. The sampler reports this, the
              * gate is what stops the next expensive step from crossing the wall. */
             if (config.heapGate !== false) {
-              const verdict = admit(readLive(), exec, { crashMB: crashWallMB(home) });
+              const live = readLive();
+              const verdict = admit(live, exec, { crashMB: crashWallMB(home, live.limitMB), limitMB: live.limitMB });
               if (!verdict.ok) {
                 record({ rule: verdict.rule, title: verdict.title }, 'pre-execute', '', verdict.reason, mode === 'observe' ? 'observe' : 'deny', exec?.callId);
                 if (mode !== 'observe') return denial(verdict.reason, { ruleId: verdict.rule, title: verdict.title });
@@ -1224,7 +1225,7 @@ export function apply(ctx, config = {}) {
       if (!sourceId) return '不知道要转世哪个会话：请传 sessionId。什么都没改。';
       const one = await handoffOne(ctx, { home, state, sessions, call, sourceId, current: me, args });
       /* ok 只认硬盘：交接单真的写下去且回读一致才是 true。失败的正文已经回填在 text 里。 */
-      const out = { text: one.text, ok: one.ok === true, briefPath: one.briefPath, briefChars: one.briefChars, delivered: one.delivered };
+      const out = { text: one.text, ok: one.ok === true, attached: one.attached === true, briefPath: one.briefPath, briefChars: one.briefChars, delivered: one.delivered };
       if (one.dryRun) return { ...out, dryRun: true };
       if (!one.ok) return out;
       return { ...out, childId: one.childId, parentId: one.parentId, generation: one.generation, archived: one.archived, llm: one.llm };
@@ -1299,7 +1300,7 @@ export function apply(ctx, config = {}) {
        * that already died repeatedly are the two facts the write gate cannot see. */
       const loops = crashLoops(readIncidents(home), { now: Date.now() });
       for (const line of loopLines(loops)) lines.push(line);
-      noteCrashMB(crashWallMB(home));
+      noteCrashMB(crashWallMB(home, readLive().limitMB));
       const heap = watchdogStatus();
       lines.push(heapLine(heap));
       lines.push(badgeState.mounted ? `内存状态圈 已挂载 ${badgeState.path}` : `内存状态圈 未挂载${badgeState.error ? `（${badgeState.error}）` : ''}`);

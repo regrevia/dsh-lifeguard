@@ -1,27 +1,45 @@
 /**
- * 满阈值 = 本机崩溃日志里最高的一次致命堆，且必须能跟着日志变。这一段是纯函数：签名文本解析、
- * 取最大、脏数据不吃掉整个读数；动态刷新由 index 的 stat 缓存负责，这里钉住数据来源。
+ * 崩溃点只认「同一档上限」下死过的记录：上限换过之后旧档的死亡点对新档没有意义，
+ * 记录里没写上限的也无法确认在哪一档，一律不采信。纯函数：签名文本解析、取最大、
+ * 脏数据不吃掉整个读数；日志变动由 index 的 stat 缓存负责。
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { maxCrashHeapMB } from '../core.mjs';
 
-test('取本机最高致命堆，不是最近一次也不是平均', () => {
+test('取同一档上限下最高的致命堆，不是最近一次也不是平均', () => {
   const rows = [
-    { signature: 'out-of-memory · heap 3529 MB' },
-    { signature: 'out-of-memory · heap 4037 MB' },
-    { signature: 'out-of-memory · heap 3654 MB' },
+    { signature: 'out-of-memory · heap 3529 MB', limitMB: 4096 },
+    { signature: 'out-of-memory · heap 4037 MB', limitMB: 4096 },
+    { signature: 'out-of-memory · heap 3654 MB', limitMB: 4096 },
   ];
+  assert.equal(maxCrashHeapMB(rows, { limitMB: 4096 }), 4037);
   assert.equal(maxCrashHeapMB(rows), 4037);
 });
 
-test('没有崩溃记录就是 0：调用方据此退回「上限 × 85%」', () => {
+test('换了上限，旧档的死亡点不作数', () => {
+  const rows = [
+    { signature: 'out-of-memory · heap 4037 MB', limitMB: 4096 },
+    { signature: 'out-of-memory · heap 8300 MB', limitMB: 8384 },
+  ];
+  assert.equal(maxCrashHeapMB(rows, { limitMB: 8384 }), 8300);
+  assert.equal(maxCrashHeapMB(rows, { limitMB: 4096 }), 4037);
+});
+
+test('记录没写上限就不采信：旧日志无法确认是哪一档', () => {
+  const rows = [{ signature: 'out-of-memory · heap 3917 MB' }];
+  assert.equal(maxCrashHeapMB(rows), 0);
+  assert.equal(maxCrashHeapMB(rows, { limitMB: 8384 }), 0);
+});
+
+test('没有可采信的崩溃记录就是 0：墙就退回上限本身', () => {
   assert.equal(maxCrashHeapMB([]), 0);
   assert.equal(maxCrashHeapMB(undefined), 0);
   assert.equal(maxCrashHeapMB([{ signature: 'SyntaxError · Unexpected token' }]), 0);
 });
 
 test('脏条目不影响读数', () => {
-  const rows = [{ signature: null }, {}, { signature: 'heap abc MB' }, { signature: 'heap 3900 MB' }];
+  const rows = [{ signature: null }, {}, { signature: 'heap abc MB' }, { signature: 'heap 3900 MB', limitMB: 4096 }];
+  assert.equal(maxCrashHeapMB(rows, { limitMB: 4096 }), 3900);
   assert.equal(maxCrashHeapMB(rows), 3900);
 });

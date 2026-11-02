@@ -28,6 +28,8 @@ function fakeHost({ llm } = {}) {
     archive: [],
     prepare: [],
     stream: [],
+    attach: [],
+    indexHeader: [],
   };
   const sessionController = {
     async list() {
@@ -39,6 +41,8 @@ function fakeHost({ llm } = {}) {
     },
     async create(seed) {
       calls.create.push(seed);
+      /* 真实 gateway：传 workspaceId 时建完自己写进 sessionIds（dsh-api-session-controller create）。 */
+      if (seed?.workspaceId === 'ws-1' && !workspace.sessionIds.includes('child-1')) workspace.sessionIds.push('child-1');
       return { sessionId: 'child-1' };
     },
     async rename(args) {
@@ -56,7 +60,22 @@ function fakeHost({ llm } = {}) {
       calls.archive.push(args);
     },
   };
-  const services = { sessionController, workspaceController };
+  /* 原会话属于 ws-1（和真实侧栏一样：分组只看 workspace.sessionIds）。 */
+  const workspace = {
+    id: 'ws-1',
+    name: 'creator-studio',
+    sessionIds: ['parent-1'],
+    async attachSession(sessionId) {
+      calls.attach.push(sessionId);
+      if (!this.sessionIds.includes(sessionId)) this.sessionIds.push(sessionId);
+    },
+  };
+  const registry = {
+    list: () => [workspace],
+    resolveByPath: async (target) => (target === '/tmp' ? workspace : undefined),
+    indexHeader: async (header) => { calls.indexHeader.push(header); },
+  };
+  const services = { sessionController, workspaceController, workspaceRegistry: registry };
   if (llm) {
     services.llm = {
       async prepareCall(request, signal) {
@@ -332,5 +351,40 @@ test('交接单写不进硬盘时明说这次不算数，并把正文带回结�
   assert.equal(result.briefPath, undefined);
   assert.match(result.text, /不算数|没写成功/);
   assert.match(result.text, /把底部状态圈换成圆环/, '落盘失败时正文必须回填到工具结果');
+  ctx.dispose();
+});
+
+test('新会话按原会话的项目建：传 workspaceId，不用 cwd 猜', async () => {
+  const { result, calls } = await run({ llm: { stream: goodStream } });
+  assert.deepEqual(calls.create[0], { workspaceId: 'ws-1' });
+  assert.equal(calls.attach.length, 0, JSON.stringify({ attach: calls.attach, ids: calls.ids }));
+  assert.equal(result.attached, true);
+});
+
+test('原会话不属于任何项目时才退回 cwd', async () => {
+  const host = fakeHost({ llm: { stream: goodStream } });
+  host.services.workspaceRegistry.list = () => [];
+  const ctx = makeContext(host.services);
+  const home = tmp();
+  apply(ctx, { home });
+  const result = await handoffTool(ctx).execute({ sessionId: 'parent-1' }, { signal: new AbortController().signal });
+  assert.deepEqual(host.calls.create[0], { cwd: '/tmp' });
+  assert.equal(result.ok, true);
+  ctx.dispose();
+});
+
+test('项目没收下这个会话时补挂一次，挂不上就说清楚', async () => {
+  const host = fakeHost({ llm: { stream: goodStream } });
+  /* 建好了但项目没收下（比如宿主那一步 attach 失败），插件要自己补一次。 */
+  host.services.sessionController.create = async (seed) => {
+    host.calls.create.push(seed);
+    return { sessionId: 'child-1' };
+  };
+  const ctx = makeContext(host.services);
+  apply(ctx, { home: tmp() });
+  const result = await handoffTool(ctx).execute({ sessionId: 'parent-1' }, { signal: new AbortController().signal });
+  assert.deepEqual(host.calls.create[0], { workspaceId: 'ws-1' });
+  assert.deepEqual(host.calls.attach, ['child-1'], JSON.stringify({ attached: result.attached, note: result.text }));
+  assert.equal(result.attached, true);
   ctx.dispose();
 });
