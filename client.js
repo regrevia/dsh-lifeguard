@@ -8,8 +8,8 @@ window.__ModuleLoader__.load({
     const React = load('react');
     const h = React.createElement;
     const POLL_MS = 5000;
-    const SIZE = 16;
-    const STROKE = 2.5;
+    const SIZE = 14;
+    const STROKE = 2;
     const RADIUS = (SIZE - STROKE) / 2;
     const CIRCUMFERENCE = 2 * Math.PI * RADIUS;
     const DANGER = 85;
@@ -17,12 +17,14 @@ window.__ModuleLoader__.load({
     const RED = '#e5484d';
     const AMBER = '#d9930d';
     /* 感叹号字号，只给字形用。 */
-    const MARK_FONT = 9;
+    const MARK_FONT = 8;
     const PANEL_WIDTH = 320;
     const MARGIN = 8;
     /* 状态词说人话；认不出的不写。 */
     const STATUS = { running: '运行中', stopping: '正在停', finished: '已结束', failed: '已失败', killed: '已终止', stopped: '已停止' };
     const FONT = 12;
+    /* 状态条那一档：与核心状态条的字号一致（13px - 1px）。 */
+    const BADGE_FONT = 'calc(var(--dsh-content-font-size-secondary, 13px) - 1px)';
     const TITLE_FONT = 14;
 
     function colorOf(pct) {
@@ -53,10 +55,12 @@ window.__ModuleLoader__.load({
 
     function Ring(props) {
       const pct = Math.max(0, Math.min(100, props.pct));
-      const color = colorOf(pct);
-      const danger = pct >= DANGER;
+      /* 告警线由后端给：两端用同一把尺子，没给才退回本地的 70/85。 */
+      const danger = typeof props.danger === 'boolean' ? props.danger : pct >= DANGER;
+      const warn = typeof props.warn === 'boolean' ? props.warn : pct >= WARN;
+      const color = danger ? RED : warn ? AMBER : 'currentColor';
       /* 越松越淡，接近告警才回实色。 */
-      const weight = danger ? 1 : pct >= WARN ? 0.8 : pct >= 50 ? 0.5 : 0.32;
+      const weight = danger ? 1 : warn ? 0.8 : pct >= 50 ? 0.5 : 0.32;
       const arc = h('circle', { key: 'arc', cx: SIZE / 2, cy: SIZE / 2, r: RADIUS, fill: 'none', stroke: color, strokeWidth: STROKE, strokeLinecap: 'round', strokeDasharray: CIRCUMFERENCE, strokeDashoffset: CIRCUMFERENCE * (1 - pct / 100), opacity: weight, transform: `rotate(-90 ${SIZE / 2} ${SIZE / 2})` });
       const track = h('circle', { key: 'track', cx: SIZE / 2, cy: SIZE / 2, r: RADIUS, fill: 'none', stroke: 'currentColor', strokeWidth: STROKE, opacity: 0.22 });
       const parts = [track, arc];
@@ -140,9 +144,19 @@ window.__ModuleLoader__.load({
       const titleStyle = { flex: '1 1 auto', fontSize: TITLE_FONT, fontWeight: 600, color: 'var(--dsw-alias-label-primary, inherit)' };
       const figureStyle = { fontSize: FONT, fontVariantNumeric: 'tabular-nums', color: 'var(--dsw-alias-label-secondary, inherit)' };
       const noteStyle = { marginTop: 2, fontSize: FONT, lineHeight: 1.5, color: 'var(--dsw-alias-label-tertiary, inherit)' };
+      const heapMB = Number(state?.heapMB) || 0;
+      const wallMB = Number(state?.wallMB) || 0;
+      const trend = Number(state?.trendMBPerMin) || 0;
+      const etaMin = trend > 0 && wallMB > heapMB ? Math.ceil((wallMB - heapMB) / trend) : 0;
+      const crash = state && state.lastCrash;
+      const notes = [];
+      notes.push(sessions.length ? `按记录体积折算，估合计 ${mb(totalMB * 1024 * 1024)}` : '读数还没到');
+      if (crash && crash.heapMB) notes.push(`上次崩溃在 ${crash.heapMB} MB · ${shortAge(crash.ageMin)}${crash.count > 1 ? ` · 共 ${crash.count} 次` : ''}`);
+      if (trend > 0) notes.push(`最近每分钟 +${trend} MB${etaMin > 0 && etaMin <= 60 ? ` · 约 ${etaMin} 分钟后到满` : ''}`);
+      else if (state && state.basis === 'crash') notes.push(`满线 ${wallMB} MB，按崩溃点校准`);
       const head = h('div', { style: headStyle },
         h('div', { style: rowStyle }, h('span', { style: titleStyle }, '内存构成'), h('span', { style: figureStyle }, `${state.heapMB} / ${state.wallMB} MB`)),
-        h('div', { style: noteStyle }, sessions.length ? `按记录体积折算，估合计 ${mb(totalMB * 1024 * 1024)}` : '读数还没到'),
+        h('div', { style: noteStyle }, notes.map((line, index) => h('div', { key: index }, line))),
       );
       const list = sessions.length ? h('div', { style: { maxHeight: 'min(420px, 60vh)', overflowY: 'auto', padding: '0 4px 6px' } }, rows) : null;
       const foot = sessions.length && breakdown.staleCount ? h('div', { style: { padding: '0 12px 10px', fontSize: FONT, lineHeight: 1.5, color: 'var(--dsw-alias-label-tertiary, inherit)' } }, `另有 ${breakdown.staleCount} 个会话没打开，不占内存`) : null;
@@ -205,21 +219,28 @@ window.__ModuleLoader__.load({
 
       const known = Boolean(state) && Number.isFinite(state.pct);
       const pct = known ? state.pct : 0;
-      const color = known && pct >= DANGER ? RED : known && pct >= WARN ? AMBER : 'inherit';
+      const heapMB = known ? Number(state.heapMB) || 0 : 0;
+      const warnMB = known ? Number(state.warnMB) || 0 : 0;
+      const criticalMB = known ? Number(state.criticalMB) || 0 : 0;
+      /* 红黄线以后端为准；老版本没这两个字段时退回百分比。 */
+      const danger = known && (criticalMB > 0 ? heapMB >= criticalMB : pct >= DANGER);
+      const warn = known && (warnMB > 0 ? heapMB >= warnMB : pct >= WARN);
+      const color = danger ? RED : warn ? AMBER : 'inherit';
       /* 数字跟着环一起退：低压淡，接近上限才实。 */
-      const readout = !known ? 0.5 : pct >= DANGER ? 1 : pct >= WARN ? 0.8 : pct >= 50 ? 0.6 : 0.42;
+      const readout = !known ? 0.5 : danger ? 1 : warn ? 0.8 : pct >= 50 ? 0.6 : 0.42;
       const toggle = () => {
         const rect = button.current ? button.current.getBoundingClientRect() : null;
         setAnchor(rect ? { left: rect.left, top: rect.top } : null);
         setOpen((was) => !was);
       };
 
-      const triggerStyle = { position: 'relative', display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: FONT, lineHeight: 1, color, whiteSpace: 'nowrap', userSelect: 'none', opacity: known ? 1 : 0.5, cursor: 'pointer', padding: 0, margin: 0, border: 0, background: 'transparent', font: 'inherit' };
+      /* 字号、行高、环径对齐旁边核心状态条。 */
+      const triggerStyle = { font: 'inherit', position: 'relative', display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: BADGE_FONT, lineHeight: '20px', color, whiteSpace: 'nowrap', userSelect: 'none', opacity: known ? 1 : 0.5, cursor: 'pointer', padding: 0, margin: 0, border: 0, background: 'transparent' };
       const label = known ? `内存占用 ${state.heapMB}/${state.wallMB} MB，点开看构成` : '内存读数还没到';
       return h(React.Fragment, null,
         h('button', { ref: button, type: 'button', onClick: toggle, 'aria-haspopup': 'dialog', 'aria-expanded': open, 'aria-label': label, style: triggerStyle },
           h('span', { style: { opacity: 0.66 } }, '内存'),
-          h(Ring, { pct }),
+          h(Ring, { pct, danger, warn }),
           h('span', { style: { fontVariantNumeric: 'tabular-nums', opacity: readout } }, known ? `${pct}%` : '–'),
         ),
         open && known ? h(Panel, { state, breakdown, open, anchor, onClose: () => setOpen(false) }) : null,

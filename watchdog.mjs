@@ -160,9 +160,23 @@ export function startWatchdog(home = DEFAULT_HOME, options = {}) {
     /* best effort */
   }
   try {
-    const timer = setInterval(() => watched(), Number(watcher.config.intervalMs));
-    timer.unref?.();
-    watcher.timer = timer;
+    /* 一分钟一次在快满的时候会漏掉最后一截（实测峰值少记三百兆）：过 70% 就十秒一次，
+     * 退回低位再放慢，采样开销只在真正要死的时候多花一点。 */
+    const baseMs = Math.max(5_000, Number(watcher.config.intervalMs) || 60_000);
+    const hotMs = Math.min(baseMs, 10_000);
+    const tick = () => {
+      try {
+        watcher.sampleOnce();
+      } catch {
+        /* 采样失败不能把定时器带停 */
+      }
+      const status = watcher.status();
+      const hot = status.limitMB > 0 && (status.heapMB / status.limitMB) >= 0.7;
+      watcher.timer = setTimeout(tick, hot ? hotMs : baseMs);
+      watcher.timer.unref?.();
+    };
+    watcher.timer = setTimeout(tick, baseMs);
+    watcher.timer.unref?.();
   } catch {
     /* no timer service: keep the single baseline sample */
   }

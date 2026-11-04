@@ -159,7 +159,7 @@ export function admit(reading, exec, options = {}) {
   const reason = [
     `堆 ${heapMB} MB，上限 ${limitMB || '未知'} MB，墙 ${wallMB} MB（${basis === 'crash' ? '崩溃点校准' : '这就是上限，越过去进程就死'}）。`,
     `这一步（${name || '未命名工具'}）预计还要 ${costMB} MB，落地后约 ${projected} MB，会比墙还高。`,
-    `现在只剩 ${headroom} MB 余量，跑它就压在墙上。`,
+    `现在离墙只剩 ${headroom} MB，跑它就压在墙上。`,
     '改法：先把当前进展写成交接单（lifeguard_handoff 的 dryRun 先看清要交接什么），确认落盘后再退出 DSH 重开；重开后一次只恢复一个会话。',
     '要只是看一眼数字，lifeguard_guard、lifeguard_scan 这类诊断工具不会被拦。',
   ].join('\n');

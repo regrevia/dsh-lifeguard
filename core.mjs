@@ -17,7 +17,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 import { correlateIncidents, crashLoops } from './lib/attribute.mjs';
 import { footprintBefore } from './lib/sessions.mjs';
 
-export const VERSION = '0.7.9';
+export const VERSION = '0.7.10';
 export const DEFAULT_HOME = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
 
 /* 新数据目录；旧版目录名只用于一次性迁移与读取回退。 */
@@ -593,8 +593,12 @@ export function maxCrashHeapMB(incidents = [], options = {}) {
     if (!heap) continue;
     const recorded = Number(incident?.limitMB) || 0;
     if (want) {
-      /* 同一档才作数；记录没写上限就无法确认它在哪一档，宁可不采信。 */
-      if (!recorded || Math.abs(recorded - want) > want * 0.02) continue;
+      /* 同一档才作数：写明了上限就按 2% 容差对；没写上限的记录（宿主的崩溃日志不带上限）用
+       * 「落在当前上限的 90%–100% 之间」当证据——8 GB 时代三次死在 8.0–8.2 GB，若一律丢掉，
+       * 墙就永远退回上限本身，红灯亮起时其实只剩三百兆。 */
+      if (recorded) {
+        if (Math.abs(recorded - want) > want * 0.02) continue;
+      } else if (heap < want * 0.9 || heap > want) continue;
     } else if (!recorded) {
       continue;
     }

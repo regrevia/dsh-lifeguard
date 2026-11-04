@@ -20,7 +20,17 @@ test('client bundle parses and registers the health ring in the composer dock', 
   assert.match(source, /id: 'dsh-lifeguard'/);
   assert.match(source, /conversation\.composer\.dock/);
   assert.match(source, /\/lifeguard\/health/);
+  assert.match(source, /\/lifeguard\/memory/, '点开圈要拉构成，路由不能少');
   assert.match(source, /inject: \['slots'\]/);
+});
+
+test('红黄线以后端为准，老版本没这两个字段才退回百分比', async () => {
+  const source = await text('client.js');
+  assert.match(source, /warnMB/, '后端给了告警线就要用');
+  assert.match(source, /criticalMB/);
+  assert.match(source, /typeof props\.danger === 'boolean'/);
+  assert.match(source, /lastCrash/, '圈上点开要能看见上次崩在哪');
+  assert.match(source, /trendMBPerMin/, '增速和到满时间也要上屏');
 });
 
 test('the manifest exposes the client half and points the loader at it', async () => {

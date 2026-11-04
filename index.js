@@ -13,7 +13,7 @@ import { compactRules, DEFAULT_HOME, importCorpus, maxCrashHeapMB, migrateLegacy
 import { guardWrite, guardShell, preExecute, liveSurfaces, denial } from './defense.mjs';
 import { heapLine, heapPressure, noteCrashMB, startWatchdog, stopWatchdog, watchdogStatus } from './watchdog.mjs';
 import { DEFAULT_BUDGET_MB, SWEEP_EVERY_MS, maybeSweep } from './tmp.mjs';
-import { admit, readLive, wallFor } from './pressure.mjs';
+import { admit, readLive, thresholdsFor, wallFor } from './pressure.mjs';
 import { footprintLines, oomEvidenceLines, sessionFootprint } from './lib/sessions.mjs';
 import { buildMemory } from './lib/memory.mjs';
 import { crashLoops, loopLines } from './lib/attribute.mjs';
@@ -277,18 +277,61 @@ function handoffRoom(home) {
   return { ok: ratio < HANDOFF_STOP_RATIO, ratio, wallMB, basis, live };
 }
 
-/* One allocation-free reading for the composer badge. The figure stays out of prompts. */
+/* 最近一次致命堆：圈上点开要能看见「昨晚崩过一次」，崩溃记录本来就在盘上。
+ * 崩溃记录只在开圈时用，15 秒缓存够省，也不至于显示上一次的旧账。 */
+const CRASH_DIGEST_TTL_MS = 15000;
+const crashDigest = { at: 0, value: null };
+function lastCrash(home) {
+  const now = Date.now();
+  if (now - crashDigest.at < CRASH_DIGEST_TTL_MS) return crashDigest.value;
+  let value = null;
+  try {
+    const rows = readIncidents(home).filter((row) => row && row.kind === 'out-of-memory');
+    if (rows.length) {
+      let newest = rows[0];
+      for (const row of rows) {
+        if (Date.parse(row.lastTs ?? row.ts ?? 0) > Date.parse(newest.lastTs ?? newest.ts ?? 0)) newest = row;
+      }
+      const at = Date.parse(newest.lastTs ?? newest.ts ?? '') || 0;
+      value = {
+        count: rows.length,
+        heapMB: Number(/heap\s+(\d+)\s*MB/.exec(String(newest.signature ?? ''))?.[1]) || 0,
+        ageMin: at ? Math.max(0, Math.round((now - at) / 60_000)) : 0,
+      };
+    }
+  } catch {
+    value = null;
+  }
+  crashDigest.at = now;
+  crashDigest.value = value;
+  return value;
+}
+
+/* One allocation-free reading for the composer badge. The figure stays out of prompts.
+ * 读数里带上告警线：前端不再自己定 70/85，两端用同一条尺子。 */
 function healthPayload(home) {
   try {
     const status = watchdogStatus();
+    const crashMB = crashWallMB(home, status?.limitMB);
     /* 状态行和这里必须是同一把尺子：读完历史先告诉观测层，100% 才始终等于「死过一次的堆」。 */
-    noteCrashMB(crashWallMB(home, status?.limitMB));
-    const pressure = heapPressure(status, { limitMB: status?.limitMB, crashMB: crashWallMB(home, status?.limitMB) });
+    noteCrashMB(crashMB);
+    const pressure = heapPressure(status, { limitMB: status?.limitMB, crashMB });
+    const { warnMB, criticalMB } = thresholdsFor(status?.limitMB ?? 0, { crashMB });
+    const crash = lastCrash(home);
     const row = { enabled: true, pct: pressure.pct, wallMB: pressure.wallMB, basis: pressure.basis };
-    Object.assign(row, { heapMB: status?.heapMB ?? 0, peakMB: status?.peakMB ?? 0, limitMB: status?.limitMB ?? 0 });
+    Object.assign(row, {
+      heapMB: status?.heapMB ?? 0,
+      /* 采样间隔会漏掉最后一截：崩溃记录里的堆就是死前那一刻，峰值跟它取大。 */
+      peakMB: Math.max(status?.peakMB ?? 0, crash?.heapMB ?? 0),
+      limitMB: status?.limitMB ?? 0,
+      warnMB,
+      criticalMB,
+      trendMBPerMin: status?.trendMBPerMin ?? 0,
+    });
+    if (crash) row.lastCrash = crash;
     return row;
   } catch {
-    return { enabled: true, pct: 0, wallMB: 0, basis: 'none', heapMB: 0, peakMB: 0, limitMB: 0 };
+    return { enabled: true, pct: 0, wallMB: 0, basis: 'none', heapMB: 0, peakMB: 0, limitMB: 0, warnMB: 0, criticalMB: 0, trendMBPerMin: 0 };
   }
 }
 
@@ -599,8 +642,6 @@ async function handoffOne(ctx, { home, state, sessions, call, sourceId, current,
   } else if (briefSaved) {
     delivered = 'file';
   }
-  /* 归档是人的动作：转世后由用户自己点，插件不碰列表状态。 */
-  const archived = false;
   let generation = 1;
   try {
     generation = generationOf(readLineage(home), sourceId);
@@ -638,7 +679,8 @@ async function handoffOne(ctx, { home, state, sessions, call, sourceId, current,
     parentId: sourceId,
     generation,
     delivered,
-    archived,
+    /* 归档是人的动作：转世后由用户自己点，插件不碰列表状态。 */
+    archived: false,
     attached,
     /* 没写下去就不报路径：路径存在感会让人以为硬盘上有东西。 */
     briefPath: briefSaved ? briefPath : undefined,
